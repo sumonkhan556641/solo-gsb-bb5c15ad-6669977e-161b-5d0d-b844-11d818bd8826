@@ -33,46 +33,103 @@ const CUE_KEY_SEP = '\u001f'; // 口令键：身份 / 区域 / 秒 分隔（单�
 
 class ImportFileError extends Error {}
 
-/** 极简 RFC 4180 风格 CSV 解析：支持双引号包裹、"" 转义、CRLF/LF、UTF-8 BOM */
+/**
+ * RFC 4180 风格 CSV 解析（支持双引号包裹、"" 转义、CRLF/LF、引号字段内换行、UTF-8 BOM）。
+ *
+ * 按「引号状态」严格区分字段的三个位置，非法引号一律作为文件结构错误抛 ImportFileError，
+ * 调用方（导入预览 / 提交、复盘分析 / 报告）必须终止处理，绝不能把错误内容当成有效字段：
+ * - 字段起始（start）：只有此处的引号可以开启引号字段；普通字符进入未引用字段体；
+ * - 未引用字段体（body）：出现引号即非法（如 张"三"丰 会把引号吞掉拼成「张三丰」，必须拒绝）；
+ * - 引号内（quoted）：字符原样保留，仅允许两个连续引号 "" 表示一个字面引号；
+ * - 引号闭合后（closed）：只允许逗号 / 换行 / 文件结束，再出现任何字符（含引号）均为非法
+ *   （如 "张三"丰 不得被静默拼成「张三丰」）。
+ */
 function parseCsv(text) {
   if (text.charCodeAt(0) === 0xfeff) text = text.slice(1); // 去 BOM
   const rows = [];
   let row = [];
   let field = '';
-  let inQuotes = false;
+  // 字段引号状态：start 字段起始 / body 未引用字段体 / quoted 引号内 / closed 引号已闭合
+  let state = 'start';
+  let line = 1; // 物理行号（含 BOM 后的首行；引号字段内换行也计数，便于定位结构错误）
+
+  const endField = () => {
+    row.push(field);
+    field = '';
+    state = 'start';
+  };
+  const endRow = () => {
+    row.push(field);
+    rows.push(row);
+    row = [];
+    field = '';
+    state = 'start';
+  };
 
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
-    if (inQuotes) {
+    if (ch === '\n') line++; // 物理行号对所有状态生效（含引号字段内的换行）
+    if (state === 'start') {
       if (ch === '"') {
-        if (text[i + 1] === '"') {
-          field += '"';
-          i++;
-        } else {
-          inQuotes = false;
-        }
+        state = 'quoted'; // 引号只能在字段起始开启
+      } else if (ch === ',') {
+        endField();
+      } else if (ch === '\n' || ch === '\r') {
+        if (ch === '\r' && text[i + 1] === '\n') i++;
+        endRow();
+      } else {
+        field += ch;
+        state = 'body';
+      }
+      continue;
+    }
+    if (state === 'body') {
+      if (ch === '"') {
+        throw new ImportFileError(
+          `CSV 第 ${line} 行存在非法引号：未加引号的字段中间不允许出现引号；` +
+            '若字段内容需要包含引号，请将整个字段用双引号包裹，并把内容中的引号写成两个连续双引号（""）'
+        );
+      }
+      if (ch === ',') {
+        endField();
+      } else if (ch === '\n' || ch === '\r') {
+        if (ch === '\r' && text[i + 1] === '\n') i++;
+        endRow();
       } else {
         field += ch;
       }
       continue;
     }
-    if (ch === '"') {
-      inQuotes = true;
-    } else if (ch === ',') {
-      row.push(field);
-      field = '';
+    if (state === 'quoted') {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          field += '"'; // 引号内仅允许 "" 表示字面引号
+          i++;
+        } else {
+          state = 'closed';
+        }
+      } else {
+        field += ch; // 引号字段内的逗号、换行等字符原样保留
+      }
+      continue;
+    }
+    // state === 'closed'：引号已闭合，只允许逗号 / 换行 / 文件结束
+    if (ch === ',') {
+      endField();
     } else if (ch === '\n' || ch === '\r') {
       if (ch === '\r' && text[i + 1] === '\n') i++;
-      row.push(field);
-      rows.push(row);
-      row = [];
-      field = '';
+      endRow();
     } else {
-      field += ch;
+      throw new ImportFileError(
+        `CSV 第 ${line} 行的引号闭合后仍有内容：引号字段闭合后只允许紧接逗号或换行，` +
+          '请检查引号位置（字段内含逗号、换行或引号时，须将整个字段用双引号包裹并以 "" 转义）'
+      );
     }
   }
-  if (inQuotes) throw new ImportFileError('CSV 中存在未闭合的引号，请检查引号是否成对出现');
-  if (field !== '' || row.length > 0) {
+  if (state === 'quoted') {
+    throw new ImportFileError(`CSV 第 ${line} 行存在未闭合的引号，请检查引号是否成对出现`);
+  }
+  if (state === 'closed' || field !== '' || row.length > 0) {
     row.push(field);
     rows.push(row);
   }
