@@ -33,46 +33,115 @@ const CUE_KEY_SEP = '\u001f'; // 口令键：身份 / 区域 / 秒 分隔（单�
 
 class ImportFileError extends Error {}
 
-/** 极简 RFC 4180 风格 CSV 解析：支持双引号包裹、"" 转义、CRLF/LF、UTF-8 BOM */
+/**
+ * 严格 RFC 4180 风格 CSV 解析：支持双引号包裹、"" 转义、CRLF/LF、UTF-8 BOM。
+ * 按引号位置把字段拆成四种状态，非法引号一律作为文件结构错误抛 ImportFileError：
+ *   START  字段起始：尚未消费任何字符，只有此时遇到 " 才能开启引号字段；
+ *   BARE   未加引号正文字段（起始后写过普通字符）：此状态下再遇 " 即非法
+ *          （如 张"三"丰——引号不会被吞掉、也不会被当成合法内容）；
+ *   QUOTED 引号内：逗号 / CR / LF 均为字段内容，连续两个 "" 表示一个字面引号；
+ *   CLOSED 闭合引号之后：只允许逗号、行结束（CR/LF）或文件结束，出现任何其它字符
+ *          （包括再遇引号）均为非法，杜绝闭合后夹带字符被静默当成字段内容。
+ * 引号未成对（文件结束时仍处于 QUOTED）同为结构错误；错误信息带 CSV 物理行号。
+ */
 function parseCsv(text) {
   if (text.charCodeAt(0) === 0xfeff) text = text.slice(1); // 去 BOM
+
+  const START = 0; // 字段起始（引号仅允许在此开启）
+  const BARE = 1; // 未加引号正文中
+  const QUOTED = 2; // 引号内
+  const CLOSED = 3; // 闭合引号之后
+
   const rows = [];
   let row = [];
   let field = '';
-  let inQuotes = false;
+  let state = START;
+  let line = 1; // CSV 物理行号（从 1 起；引号字段内的换行也计数）
+  let quoteStartLine = 0; // 当前引号字段起始行（未闭合报错用）
+
+  const endField = () => {
+    row.push(field);
+    field = '';
+    state = START;
+  };
+  // 行结束：CRLF 计为一行并额外消费一个字符，CR / LF 同样计一行
+  const consumeLineEnd = (i) => (text[i] === '\r' && text[i + 1] === '\n' ? 2 : 1);
+  const endRow = (consumed) => {
+    endField();
+    rows.push(row);
+    row = [];
+    line += 1;
+    return consumed; // 行结束序列消耗的字符数（1 或 2）
+  };
 
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
-    if (inQuotes) {
+
+    if (state === QUOTED) {
       if (ch === '"') {
         if (text[i + 1] === '"') {
-          field += '"';
+          field += '"'; // 引号内 "" 转义为一个字面引号
           i++;
         } else {
-          inQuotes = false;
+          state = CLOSED;
         }
+      } else if (ch === '\r') {
+        // 引号字段内的 CRLF / 单个 CR 都是字段内容，整体保留不丢字符
+        if (text[i + 1] === '\n') {
+          field += '\r\n';
+          i++;
+        } else {
+          field += '\r';
+        }
+        line++;
       } else {
-        field += ch;
+        if (ch === '\n') line++;
+        field += ch; // 引号内逗号、换行及其它字符原样保留
       }
       continue;
     }
-    if (ch === '"') {
-      inQuotes = true;
-    } else if (ch === ',') {
-      row.push(field);
-      field = '';
-    } else if (ch === '\n' || ch === '\r') {
-      if (ch === '\r' && text[i + 1] === '\n') i++;
-      row.push(field);
-      rows.push(row);
-      row = [];
-      field = '';
+
+    if (state === START || state === BARE) {
+      if (ch === '"') {
+        if (state === START) {
+          state = QUOTED; // 仅字段起始可开启引号
+          quoteStartLine = line;
+        } else {
+          throw new ImportFileError(
+            `CSV 第 ${line} 行结构错误：未加引号的字段中不能出现引号（如 张"三"丰）；含引号的字段必须从字段开头用双引号整体包裹，字段内的引号写成两个连续双引号 ""`
+          );
+        }
+      } else if (ch === ',') {
+        endField();
+      } else if (ch === '\r' || ch === '\n') {
+        i += endRow(consumeLineEnd(i)) - 1;
+      } else {
+        field += ch;
+        state = BARE; // 字段以普通字符起始：未加引号，之后引号即非法
+      }
+      continue;
+    }
+
+    // state === CLOSED：闭合引号之后只允许逗号 / 行结束
+    if (ch === ',') {
+      endField();
+    } else if (ch === '\r' || ch === '\n') {
+      i += endRow(consumeLineEnd(i)) - 1;
     } else {
-      field += ch;
+      throw new ImportFileError(
+        `CSV 第 ${line} 行结构错误：字段闭合引号之后出现了多余字符「${ch}」；闭合引号后只能紧跟逗号或换行，引号字段中的引号须写成两个连续双引号 ""`
+      );
     }
   }
-  if (inQuotes) throw new ImportFileError('CSV 中存在未闭合的引号，请检查引号是否成对出现');
-  if (field !== '' || row.length > 0) {
+
+  if (state === QUOTED) {
+    throw new ImportFileError(
+      `CSV 第 ${quoteStartLine} 行存在未闭合的引号：引号字段必须以成对的双引号结束，请检查引号是否成对出现`
+    );
+  }
+  // 文件以逗号 / 换行结尾时没有待写字段（field === '' 且 row 为空），不补空行；
+  // 否则补上最后一个字段与最后一行（含整行空白、空引号字段等合法情形）。
+  if (field !== '' || row.length > 0 || state === CLOSED) {
     row.push(field);
     rows.push(row);
   }
@@ -142,7 +211,8 @@ function dataVersion(data) {
 
 /**
  * 解析 CSV 并生成导入计划（不写库）。
- * 结构性问题（空文件 / 缺列 / 引号未闭合）抛 ImportFileError；
+ * 结构性问题（空文件 / 缺列 / 非法引号（未加引号字段中出现引号、闭合引号后夹带字符、引号未闭合）/
+ * 仅有表头）抛 ImportFileError；
  * 行级问题逐行收集在 rows[].issues，只要有错误行 validRows 之外的行均禁止提交。
  * 文件内重复按解析后的口令键判定：首个出现的行标记为文件内首次行（非错误），
  * 其后键相同的行标记为重复（错误行）；身份 / 区域 / 时间无法解析的行不混入重复判断。

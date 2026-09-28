@@ -24,7 +24,8 @@ const MAX_ROLE_LENGTH = 30;
 
 /**
  * 解析复盘 CSV 并完成对齐（不写库）。
- * 结构性问题（空文件 / 缺列 / 引号未闭合 / 仅有表头）抛 ImportFileError；
+ * 结构性问题（空文件 / 缺列 / 非法引号（未加引号字段中出现引号、闭合引号后夹带字符、引号未闭合）/
+ * 仅有表头）抛 ImportFileError；
  * 行级问题逐行收集在 rows[].issues，错误行不进入对齐。
  */
 function buildReplay(data, csv, generatedAt = new Date().toISOString()) {
